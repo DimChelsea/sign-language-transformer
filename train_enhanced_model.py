@@ -1,448 +1,210 @@
-import os
-import json
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import numpy as np
-import matplotlib.pyplot as plt
 from torch.utils.data import Dataset, DataLoader
-from torch.cuda.amp import autocast, GradScaler
-import time
-from sign_language_transformer import SignLanguageTransformer
-from finger_spelling import FingerSpellingModel
+import numpy as np
+import json
+import os
 from tqdm import tqdm
 
-# Configuration
-BATCH_SIZE = 10  # Slightly increased batch size for faster training with A100
-MAX_SEQ_LENGTH = 16
-INPUT_DIM = 543  # MediaPipe pose dimensions (33 body + 21*2 hand landmarks) * 3 (x,y,z)
-HIDDEN_DIM = 256
-NUM_LAYERS = 4
-NUM_HEADS = 8
-DROPOUT = 0.1
-LEARNING_RATE = 3e-4
-NUM_EPOCHS = 30
-USE_MIXED_PRECISION = True
-EARLY_STOPPING_PATIENCE = 5
-
-# Directory for saving models
-MODEL_DIR = '/content/drive/MyDrive/sign_language_project/models'
-os.makedirs(MODEL_DIR, exist_ok=True)
-
-# Set device
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"Using device: {device}")
-
+# Define dataset class
 class SignLanguageDataset(Dataset):
-    def __init__(self, metadata, max_seq_length=16):
-        self.metadata = metadata
-        self.max_seq_length = max_seq_length
+    def __init__(self, metadata_path, pose_dir):
+        # Load metadata
+        with open(metadata_path, 'r') as f:
+            self.metadata = json.load(f)
         
+        self.pose_dir = pose_dir
+        self.samples = []
+        
+        # Process metadata to create a list of samples
+        for item in self.metadata:
+            video_id = item['video_id']
+            pose_file = os.path.join(pose_dir, f"{video_id}.npy")
+            
+            if os.path.exists(pose_file):
+                self.samples.append({
+                    'pose_file': pose_file,
+                    'label': item['label_index']
+                })
+    
     def __len__(self):
-        return len(self.metadata)
+        return len(self.samples)
     
     def __getitem__(self, idx):
-        item = self.metadata[idx]
+        sample = self.samples[idx]
         
         # Load pose data
-        pose_path = item['pose_path']
-        pose_data = np.load(pose_path)
+        pose_data = np.load(sample['pose_file'])
         
-        # Pad or truncate sequence to max_seq_length
-        seq_len = pose_data.shape[0]
-        if seq_len > self.max_seq_length:
-            # Truncate
-            pose_data = pose_data[:self.max_seq_length]
-        elif seq_len < self.max_seq_length:
-            # Pad
-            padding = np.zeros((self.max_seq_length - seq_len, pose_data.shape[1]))
-            pose_data = np.vstack([pose_data, padding])
+        # Convert to tensor
+        pose_tensor = torch.tensor(pose_data, dtype=torch.float32)
+        label = torch.tensor(sample['label'], dtype=torch.long)
         
-        # Convert to tensors
-        pose_tensor = torch.FloatTensor(pose_data)
-        
-        # Get label
-        label = item['label_idx']
-        label_tensor = torch.LongTensor([label])
-        
-        return {
-            'pose_data': pose_tensor,
-            'label': label_tensor,
-            'video_id': item['video_id'],
-            'gloss': item['gloss']
-        }
+        return pose_tensor, label
 
+# Collate function to handle variable length sequences
 def collate_fn(batch):
-    pose_data = torch.stack([item['pose_data'] for item in batch])
-    labels = torch.cat([item['label'] for item in batch])
-    video_ids = [item['video_id'] for item in batch]
-    glosses = [item['gloss'] for item in batch]
+    # Sort batch by sequence length (descending)
+    batch.sort(key=lambda x: x[0].shape[0], reverse=True)
     
-    return {
-        'pose_data': pose_data,
-        'labels': labels,
-        'video_ids': video_ids,
-        'glosses': glosses
-    }
+    # Get sequences and labels
+    sequences = [item[0] for item in batch]
+    labels = [item[1] for item in batch]
+    
+    # Get sequence lengths
+    lengths = [seq.shape[0] for seq in sequences]
+    max_length = max(lengths)
+    
+    # Pad sequences
+    batch_size = len(sequences)
+    feature_dim = sequences[0].shape[1]
+    padded_sequences = torch.zeros(batch_size, max_length, feature_dim)
+    
+    for i, (seq, length) in enumerate(zip(sequences, lengths)):
+        padded_sequences[i, :length, :] = seq
+    
+    # Convert labels to tensor
+    labels = torch.stack(labels)
+    
+    return padded_sequences, labels
 
-def train_epoch(model, dataloader, criterion, optimizer, scaler, device):
-    model.train()
-    total_loss = 0
-    correct = 0
-    total = 0
-    
-    progress_bar = tqdm(dataloader, desc="Training")
-    for batch in progress_bar:
-        # Move data to device
-        pose_data = batch['pose_data'].to(device)
-        labels = batch['labels'].to(device)
-        
-        # Clear gradients
-        optimizer.zero_grad()
-        
-        # Forward pass with mixed precision
-        if USE_MIXED_PRECISION:
-            with autocast():
-                outputs = model(pose_data)
-                loss = criterion(outputs, labels)
-            
-            # Backward and optimize with scaled gradients
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
-        else:
-            # Standard forward and backward pass
-            outputs = model(pose_data)
-            loss = criterion(outputs, labels)
-            loss.backward()
-            optimizer.step()
-        
-        # Calculate accuracy
-        _, predicted = torch.max(outputs.data, 1)
-        total += labels.size(0)
-        correct += (predicted == labels).sum().item()
-        
-        # Update statistics
-        total_loss += loss.item()
-        progress_bar.set_postfix({
-            'loss': total_loss / (progress_bar.n + 1),
-            'accuracy': 100 * correct / total
-        })
-    
-    return total_loss / len(dataloader), 100 * correct / total
-
-def validate(model, dataloader, criterion, device):
-    model.eval()
-    total_loss = 0
-    correct = 0
-    total = 0
-    
-    with torch.no_grad():
-        progress_bar = tqdm(dataloader, desc="Validation")
-        for batch in progress_bar:
-            # Move data to device
-            pose_data = batch['pose_data'].to(device)
-            labels = batch['labels'].to(device)
-            
-            # Forward pass
-            outputs = model(pose_data)
-            loss = criterion(outputs, labels)
-            
-            # Calculate accuracy
-            _, predicted = torch.max(outputs.data, 1)
-            total += labels.size(0)
-            correct += (predicted == labels).sum().item()
-            
-            # Update statistics
-            total_loss += loss.item()
-            progress_bar.set_postfix({
-                'loss': total_loss / (progress_bar.n + 1),
-                'accuracy': 100 * correct / total
-            })
-    
-    return total_loss / len(dataloader), 100 * correct / total
-
-def main():
-    print("Starting sign language transformer training...")
-    start_time = time.time()
-    
-    # Load metadata
-    print("Loading metadata...")
-    with open('/content/wlasl_processed_metadata.json', 'r') as f:
+def train_model(model, epochs, batch_size, learning_rate, metadata_path, pose_dir, save_dir, device):
+    # Create datasets
+    with open(metadata_path, 'r') as f:
         metadata = json.load(f)
     
-    # Prepare metadata by adding label indices
-    print("Preparing metadata...")
-    # Get unique glosses (sign classes)
-    glosses = sorted(list(set([item['gloss'] for item in metadata])))
-    num_classes = len(glosses)
-    print(f"Found {num_classes} unique sign classes")
-    
-    # Create a mapping from gloss to label index
-    gloss_to_idx = {gloss: idx for idx, gloss in enumerate(glosses)}
-    
-    # Add label indices to metadata
-    for item in metadata:
-        item['label_idx'] = gloss_to_idx[item['gloss']]
-    
-    # Train/validation split (80/20)
-    print("Splitting data into train and validation sets...")
+    # Split metadata into train and validation
+    np.random.seed(42)
     np.random.shuffle(metadata)
-    split_idx = int(0.8 * len(metadata))
+    split_idx = int(len(metadata) * 0.8)  # 80% for training, 20% for validation
     train_metadata = metadata[:split_idx]
     val_metadata = metadata[split_idx:]
     
-    print(f"Training samples: {len(train_metadata)}")
-    print(f"Validation samples: {len(val_metadata)}")
+    # Save split metadata
+    with open(os.path.join(save_dir, 'train_metadata.json'), 'w') as f:
+        json.dump(train_metadata, f)
     
-    # Create datasets and dataloaders
-    print("Creating data loaders...")
-    train_dataset = SignLanguageDataset(train_metadata, max_seq_length=MAX_SEQ_LENGTH)
-    val_dataset = SignLanguageDataset(val_metadata, max_seq_length=MAX_SEQ_LENGTH)
+    with open(os.path.join(save_dir, 'val_metadata.json'), 'w') as f:
+        json.dump(val_metadata, f)
     
-    train_loader = DataLoader(
-        train_dataset, 
-        batch_size=BATCH_SIZE, 
-        shuffle=True, 
-        collate_fn=collate_fn,
-        num_workers=2,
-        pin_memory=True
-    )
+    # Create temporary metadata files for train and val
+    train_metadata_path = os.path.join(save_dir, 'train_metadata.json')
+    val_metadata_path = os.path.join(save_dir, 'val_metadata.json')
     
-    val_loader = DataLoader(
-        val_dataset, 
-        batch_size=BATCH_SIZE, 
-        shuffle=False, 
-        collate_fn=collate_fn,
-        num_workers=2,
-        pin_memory=True
-    )
+    # Create datasets
+    train_dataset = SignLanguageDataset(train_metadata_path, pose_dir)
+    val_dataset = SignLanguageDataset(val_metadata_path, pose_dir)
     
-    # Initialize model
-    print("Initializing model...")
-    model = SignLanguageTransformer(
-        input_dim=INPUT_DIM,
-        hidden_dim=HIDDEN_DIM,
-        num_classes=num_classes,
-        num_layers=NUM_LAYERS,
-        num_heads=NUM_HEADS,
-        dropout=DROPOUT,
-        max_seq_length=MAX_SEQ_LENGTH,
-        use_finger_spelling=True
-    )
-    model = model.to(device)
+    print(f"Number of training samples: {len(train_dataset)}")
+    print(f"Number of validation samples: {len(val_dataset)}")
     
-    # Loss function and optimizer
+    # Create dataloaders
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
+    
+    # Set up optimizer and loss function
+    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
     criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
-    
-    # Initialize mixed precision scaler
-    scaler = GradScaler() if USE_MIXED_PRECISION else None
-    
-    # Check for checkpoint to resume training
-    start_epoch = 0
-    checkpoint_path = os.path.join(MODEL_DIR, 'latest_checkpoint.pth')
-    best_val_accuracy = 0
-    
-    if os.path.exists(checkpoint_path):
-        print(f"Loading checkpoint from {checkpoint_path}")
-        checkpoint = torch.load(checkpoint_path)
-        model.load_state_dict(checkpoint['model_state_dict'])
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        start_epoch = checkpoint['epoch'] + 1
-        best_val_accuracy = checkpoint.get('best_val_accuracy', 0)
-        print(f"Resuming training from epoch {start_epoch}")
-    
-    # For tracking metrics
-    train_losses = []
-    val_losses = []
-    train_accuracies = []
-    val_accuracies = []
-    epochs = []
-    
-    # Early stopping setup
-    no_improvement = 0
     
     # Training loop
-    print(f"Starting training for {NUM_EPOCHS} epochs...")
-    for epoch in range(start_epoch, NUM_EPOCHS):
-        print(f"\nEpoch {epoch+1}/{NUM_EPOCHS}")
+    train_losses = []
+    val_losses = []
+    best_val_loss = float('inf')
+    
+    for epoch in range(epochs):
+        # Training
+        model.train()
+        train_loss = 0
+        train_correct = 0
+        train_total = 0
         
-        # Train for one epoch
-        train_loss, train_acc = train_epoch(model, train_loader, criterion, optimizer, scaler, device)
-        print(f"Training Loss: {train_loss:.4f}, Accuracy: {train_acc:.2f}%")
+        for inputs, targets in tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs} [Train]"):
+            inputs, targets = inputs.to(device), targets.to(device)
+            
+            # Forward pass
+            optimizer.zero_grad()
+            outputs = model(inputs)
+            loss = criterion(outputs, targets)
+            
+            # Backward pass
+            loss.backward()
+            optimizer.step()
+            
+            # Track stats
+            train_loss += loss.item()
+            _, predicted = torch.max(outputs, 1)
+            train_total += targets.size(0)
+            train_correct += (predicted == targets).sum().item()
         
-        # Validate
-        val_loss, val_acc = validate(model, val_loader, criterion, device)
-        print(f"Validation Loss: {val_loss:.4f}, Accuracy: {val_acc:.2f}%")
+        # Average training loss
+        avg_train_loss = train_loss / len(train_loader)
+        train_losses.append(avg_train_loss)
         
-        # Track metrics
-        epochs.append(epoch + 1)
-        train_losses.append(train_loss)
-        val_losses.append(val_loss)
-        train_accuracies.append(train_acc)
-        val_accuracies.append(val_acc)
+        # Validation
+        model.eval()
+        val_loss = 0
+        val_correct = 0
+        val_total = 0
         
-        # Save checkpoint for every epoch
-        torch.save({
-            'epoch': epoch,
-            'model_state_dict': model.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-            'train_loss': train_loss,
-            'val_loss': val_loss,
-            'train_accuracy': train_acc,
-            'val_accuracy': val_acc,
-            'best_val_accuracy': best_val_accuracy
-        }, checkpoint_path)
+        with torch.no_grad():
+            for inputs, targets in tqdm(val_loader, desc=f"Epoch {epoch+1}/{epochs} [Val]"):
+                inputs, targets = inputs.to(device), targets.to(device)
+                
+                # Forward pass
+                outputs = model(inputs)
+                loss = criterion(outputs, targets)
+                
+                # Track stats
+                val_loss += loss.item()
+                _, predicted = torch.max(outputs, 1)
+                val_total += targets.size(0)
+                val_correct += (predicted == targets).sum().item()
         
-        # Save numbered checkpoint every 5 epochs
-        if (epoch + 1) % 5 == 0 or epoch == NUM_EPOCHS - 1:
-            numbered_path = os.path.join(MODEL_DIR, f'checkpoint_epoch_{epoch+1}.pth')
+        # Average validation loss
+        avg_val_loss = val_loss / len(val_loader)
+        val_losses.append(avg_val_loss)
+        
+        # Print stats
+        print(f"Epoch {epoch+1}/{epochs}")
+        print(f"Train Loss: {avg_train_loss:.4f}, Train Acc: {train_correct/train_total:.4f}")
+        print(f"Val Loss: {avg_val_loss:.4f}, Val Acc: {val_correct/val_total:.4f}")
+        print("-" * 50)
+        
+        # Save checkpoint if validation loss improved
+        if avg_val_loss < best_val_loss:
+            best_val_loss = avg_val_loss
             torch.save({
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
-                'train_loss': train_loss,
-                'val_loss': val_loss,
-                'train_accuracy': train_acc,
-                'val_accuracy': val_acc,
-                'best_val_accuracy': best_val_accuracy
-            }, numbered_path)
+                'val_loss': avg_val_loss,
+            }, os.path.join(save_dir, 'best_model.pt'))
+            print(f"Saved best model at epoch {epoch+1}")
         
-        # Check for best model and save
-        if val_acc > best_val_accuracy:
-            best_val_accuracy = val_acc
+        # Save checkpoint every 5 epochs
+        if (epoch + 1) % 5 == 0 or (epoch + 1) == epochs:
             torch.save({
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
-                'train_loss': train_loss,
-                'val_loss': val_loss,
-                'train_accuracy': train_acc,
-                'val_accuracy': val_acc,
-                'best_val_accuracy': best_val_accuracy,
-                'config': {
-                    'input_dim': INPUT_DIM,
-                    'hidden_dim': HIDDEN_DIM,
-                    'num_classes': num_classes,
-                    'num_layers': NUM_LAYERS,
-                    'dropout': DROPOUT,
-                    'max_seq_length': MAX_SEQ_LENGTH
-                }
-            }, os.path.join(MODEL_DIR, 'best_model.pth'))
-            print(f"Saved best model with validation accuracy: {val_acc:.2f}%")
-            no_improvement = 0
-        else:
-            no_improvement += 1
-        
-        # Check for early stopping
-        if no_improvement >= EARLY_STOPPING_PATIENCE:
-            print(f"Early stopping triggered after {epoch+1} epochs")
-            break
-            
-        # Plot and save metrics every 5 epochs
-        if (epoch + 1) % 5 == 0 or epoch == NUM_EPOCHS - 1:
-            # Create figure with subplots
-            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(20, 8))
-            
-            # Plot loss
-            ax1.plot(epochs, train_losses, 'b-', label='Training loss')
-            ax1.plot(epochs, val_losses, 'r-', label='Validation loss')
-            ax1.set_title('Training and Validation Loss')
-            ax1.set_xlabel('Epochs')
-            ax1.set_ylabel('Loss')
-            ax1.legend()
-            ax1.grid(True)
-            
-            # Plot accuracy
-            ax2.plot(epochs, train_accuracies, 'b-', label='Training accuracy')
-            ax2.plot(epochs, val_accuracies, 'r-', label='Validation accuracy')
-            ax2.set_title('Training and Validation Accuracy')
-            ax2.set_xlabel('Epochs')
-            ax2.set_ylabel('Accuracy (%)')
-            ax2.legend()
-            ax2.grid(True)
-            
-            # Save figure
-            plt.tight_layout()
-            plt.savefig(os.path.join(MODEL_DIR, f'metrics_epoch_{epoch+1}.png'))
-            plt.close()
-        
-        # Print time elapsed
-        elapsed = time.time() - start_time
-        hours, rem = divmod(elapsed, 3600)
-        minutes, seconds = divmod(rem, 60)
-        print(f"Time elapsed: {int(hours):02d}:{int(minutes):02d}:{int(seconds):02d}")
-        
-        # Estimate remaining time
-        if epoch > start_epoch:
-            avg_time_per_epoch = elapsed / (epoch - start_epoch + 1)
-            remaining_epochs = NUM_EPOCHS - epoch - 1
-            remaining_time = avg_time_per_epoch * remaining_epochs
-            hours, rem = divmod(remaining_time, 3600)
-            minutes, seconds = divmod(rem, 60)
-            print(f"Estimated time remaining: {int(hours):02d}:{int(minutes):02d}:{int(seconds):02d}")
+                'val_loss': avg_val_loss,
+            }, os.path.join(save_dir, f"checkpoint_epoch_{epoch+1}.pt"))
     
-    # Save final model
-    final_model_path = os.path.join(MODEL_DIR, 'final_model.pth')
-    torch.save({
-        'model_state_dict': model.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(),
-        'config': {
-            'input_dim': INPUT_DIM,
-            'hidden_dim': HIDDEN_DIM,
-            'num_classes': num_classes,
-            'num_layers': NUM_LAYERS,
-            'dropout': DROPOUT,
-            'max_seq_length': MAX_SEQ_LENGTH
-        },
-        'class_mapping': {idx: gloss for gloss, idx in gloss_to_idx.items()}
-    }, final_model_path)
-    print(f"Saved final model to {final_model_path}")
-    
-    # Create and save final plots
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(20, 8))
-    
-    # Plot loss
-    ax1.plot(epochs, train_losses, 'b-', label='Training loss')
-    ax1.plot(epochs, val_losses, 'r-', label='Validation loss')
-    ax1.set_title('Training and Validation Loss Over Full Training')
-    ax1.set_xlabel('Epochs')
-    ax1.set_ylabel('Loss')
-    ax1.legend()
-    ax1.grid(True)
-    
-    # Plot accuracy
-    ax2.plot(epochs, train_accuracies, 'b-', label='Training accuracy')
-    ax2.plot(epochs, val_accuracies, 'r-', label='Validation accuracy')
-    ax2.set_title('Training and Validation Accuracy Over Full Training')
-    ax2.set_xlabel('Epochs')
-    ax2.set_ylabel('Accuracy (%)')
-    ax2.legend()
-    ax2.grid(True)
-    
-    # Save final plot
-    plt.tight_layout()
-    plt.savefig(os.path.join(MODEL_DIR, 'final_training_metrics.png'))
-    
-    # Also save the raw metrics for further analysis
-    metrics = {
-        'epochs': epochs,
-        'train_losses': train_losses,
-        'val_losses': val_losses,
-        'train_accuracies': train_accuracies,
-        'val_accuracies': val_accuracies
-    }
-    with open(os.path.join(MODEL_DIR, 'training_metrics.json'), 'w') as f:
-        json.dump(metrics, f, indent=4)
+    # Plot training and validation loss
+    try:
+        import matplotlib.pyplot as plt
+        plt.figure(figsize=(10, 5))
+        plt.plot(train_losses, label='Training Loss')
+        plt.plot(val_losses, label='Validation Loss')
+        plt.title('Training and Validation Loss')
+        plt.xlabel('Epoch')
+        plt.ylabel('Loss')
+        plt.legend()
+        plt.savefig(os.path.join(save_dir, 'loss_plot.png'))
+        plt.close()
+    except:
+        print("Couldn't create plot. Matplotlib might not be available.")
     
     print("Training completed!")
-    
-    # Print total training time
-    total_time = time.time() - start_time
-    hours, rem = divmod(total_time, 3600)
-    minutes, seconds = divmod(rem, 60)
-    print(f"Total training time: {int(hours):02d}:{int(minutes):02d}:{int(seconds):02d}")
-
-if __name__ == "__main__":
-    main()
+    return train_losses, val_losses
